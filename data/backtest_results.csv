@@ -1,0 +1,2 @@
+timestamp,strategy,total_return,annualized_return,annualized_vol,sharpe_ratio,max_drawdown
+20251029_1832,example_momentum,2.5200814972020122,0.14743305533206263,0.19368610622250845,0.7611958245610562,-0.3657658260685307
