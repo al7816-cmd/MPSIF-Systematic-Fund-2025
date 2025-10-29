@@ -4,39 +4,45 @@ import numpy as np
 def generate_weights(prices: pd.DataFrame, rets: pd.DataFrame):
     """
     Momentum strategy:
-    - Rank stocks by 12-month return (excluding the most recent month)
-    - Hold top 20% monthly, equally weighted
+    - Ranks stocks by 12-month return (excluding most recent month)
+    - Selects top 10
+    - Allocates weights proportional to momentum scores (so total = 1)
     """
 
     lookback = 252       # ~12 months
     skip = 21            # skip most recent month
-    top_quantile = 0.2   # top 20%
+    top_n = 10           # top 10 by momentum
 
+    # Compute rolling 12-month returns excluding last month
     past_ret = prices.pct_change(lookback + skip).shift(skip)
 
-    # Use month-end dates for rebalancing
+    # Monthly rebalancing
     monthly_dates = prices.resample("M").last().index
     weights = pd.DataFrame(index=prices.index, columns=prices.columns, dtype=float)
 
     for date in monthly_dates:
-        # Find the closest date available in the data
         if date not in past_ret.index:
-            nearest_date = past_ret.index[past_ret.index.get_indexer([date], method='nearest')[0]]
-        else:
-            nearest_date = date
+            continue
 
-        mom_scores = past_ret.loc[nearest_date].dropna()
+        # Momentum scores (remove NaN and negative values)
+        mom_scores = past_ret.loc[date].dropna()
         if mom_scores.empty:
             continue
 
-        cutoff = mom_scores.quantile(1 - top_quantile)
-        winners = mom_scores[mom_scores >= cutoff].index
+        # Select top N
+        top = mom_scores.nlargest(top_n)
 
-        w = pd.Series(0.0, index=prices.columns)
-        if len(winners) > 0:
-            w[winners] = 1.0 / len(winners)
-        weights.loc[nearest_date] = w
+        # Convert raw momentum scores to proportional weights
+        positive_scores = top.clip(lower=0)  # drop negatives
+        if positive_scores.sum() == 0:
+            w = pd.Series(0, index=prices.columns)
+        else:
+            w = positive_scores / positive_scores.sum()
 
-    # Forward fill between rebalances
+        # Assign weights for these tickers only
+        weights.loc[date, w.index] = w
+
+    # Forward-fill until next rebalance
     weights = weights.ffill().fillna(0)
+
     return weights
