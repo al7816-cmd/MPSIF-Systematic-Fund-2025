@@ -6,17 +6,15 @@ def generate_weights(prices: pd.DataFrame, rets: pd.DataFrame):
     Momentum strategy:
     - Ranks stocks by 12-month return (excluding most recent month)
     - Selects top 10
-    - Allocates weights proportional to momentum scores (so total = 1)
+    - Allocates proportional to momentum scores
+    - Renormalizes to ensure total = 1.0 every month
     """
 
     lookback = 252       # ~12 months
     skip = 21            # skip most recent month
     top_n = 10           # top 10 by momentum
 
-    # Compute rolling 12-month returns excluding last month
     past_ret = prices.pct_change(lookback + skip).shift(skip)
-
-    # Monthly rebalancing
     monthly_dates = prices.resample("M").last().index
     weights = pd.DataFrame(index=prices.index, columns=prices.columns, dtype=float)
 
@@ -24,25 +22,22 @@ def generate_weights(prices: pd.DataFrame, rets: pd.DataFrame):
         if date not in past_ret.index:
             continue
 
-        # Momentum scores (remove NaN and negative values)
+        # Compute momentum
         mom_scores = past_ret.loc[date].dropna()
         if mom_scores.empty:
             continue
 
-        # Select top N
-        top = mom_scores.nlargest(top_n)
+        top = mom_scores.nlargest(top_n).clip(lower=0)
 
-        # Convert raw momentum scores to proportional weights
-        positive_scores = top.clip(lower=0)  # drop negatives
-        if positive_scores.sum() == 0:
+        if top.sum() == 0:
             w = pd.Series(0, index=prices.columns)
         else:
-            w = positive_scores / positive_scores.sum()
+            # Normalize so total = 1
+            w = top / top.sum()
 
-        # Assign weights for these tickers only
+        weights.loc[date, :] = 0
         weights.loc[date, w.index] = w
 
-    # Forward-fill until next rebalance
+    # Forward fill between rebalances
     weights = weights.ffill().fillna(0)
-
     return weights
