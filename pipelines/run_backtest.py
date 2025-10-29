@@ -1,116 +1,94 @@
-#!/usr/bin/env python3
-"""
-Run Backtest for Systematic Fund Strategies
--------------------------------------------
-
-This script:
-- Loads CRSP data
-- Runs a selected strategy (from /strategies)
-- Computes performance metrics
-- Saves daily strategy returns to /data/strategy_returns_<timestamp>.csv
-
-Usage:
-    python pipelines/run_backtest.py --strategy strategies/example_momentum.py
-"""
-
-import argparse
-import importlib.util
 import pandas as pd
 import numpy as np
+import argparse
+import importlib.util
+import os
 from datetime import datetime
-from pathlib import Path
 
-# ---------------------------------------------------------------------
-# Parse CLI arguments
-# ---------------------------------------------------------------------
-parser = argparse.ArgumentParser(description="Run backtest for a given strategy.")
-parser.add_argument("--strategy", type=str, required=True, help="Path to strategy file.")
-args = parser.parse_args()
+def load_strategy(strategy_path):
+    """Dynamically import a strategy file."""
+    spec = importlib.util.spec_from_file_location("strategy", strategy_path)
+    strategy = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(strategy)
+    return strategy
 
-STRATEGY_PATH = args.strategy
-DATA_PATH = Path("/home/nyu/willwu24/MPSIF-Systematic-Fund-2025/data/crsp_sp500_10yr.csv")
-OUTPUT_DIR = Path("/home/nyu/willwu24/MPSIF-Systematic-Fund-2025/data")
-OUTPUT_DIR.mkdir(exist_ok=True)
+def backtest(prices, rets, strategy, full_investment=True):
+    """
+    Run backtest using dynamic capital tracking.
+    - Keeps portfolio 100% invested
+    - Rebalances on strategy’s own schedule
+    """
+    print("Running strategy...")
 
-# ---------------------------------------------------------------------
-# Load CRSP data
-# ---------------------------------------------------------------------
-print("Loading CRSP data...")
-df = pd.read_csv(DATA_PATH)
-df.columns = [c.strip().lower() for c in df.columns]
-df["date"] = pd.to_datetime(df["date"])
-df["prc"] = df["prc"].abs()
-df = df.sort_values(["lpermno", "date"])
+    weights = strategy.generate_weights(prices, rets)
+    weights = weights.reindex(prices.index).fillna(method="ffill").fillna(0)
 
-print(f"Loaded {len(df):,} rows from {df['date'].min().date()} to {df['date'].max().date()}.")
+    # Ensure daily full investment exposure if specified
+    if full_investment:
+        weights = weights.div(weights.sum(axis=1).replace(0, np.nan), axis=0).fillna(0)
 
-# Pivot to wide format
-prices = df.pivot(index="date", columns="lpermno", values="prc").fillna(method="ffill")
-rets = df.pivot(index="date", columns="lpermno", values="ret_total").fillna(0)
+    # Compute portfolio daily returns
+    port_rets = (weights.shift(1) * rets).sum(axis=1)
+    port_rets = port_rets.fillna(0)
 
-# ---------------------------------------------------------------------
-# Load strategy module
-# ---------------------------------------------------------------------
-print(f"Loaded strategy: {STRATEGY_PATH}")
-spec = importlib.util.spec_from_file_location("strategy", STRATEGY_PATH)
-strategy = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(strategy)
+    # Track portfolio value over time
+    port_val = (1 + port_rets).cumprod()
 
-# ---------------------------------------------------------------------
-# Run strategy
-# ---------------------------------------------------------------------
-print("Running strategy...")
-weights = strategy.generate_weights(prices, rets)
+    # Compute performance metrics
+    total_ret = port_val.iloc[-1] - 1
+    ann_ret = (1 + total_ret) ** (252 / len(port_val)) - 1
+    ann_vol = port_rets.std() * np.sqrt(252)
+    sharpe = ann_ret / ann_vol if ann_vol != 0 else np.nan
+    running_max = port_val.cummax()
+    drawdown = (port_val - running_max) / running_max
+    max_dd = drawdown.min()
 
-# Ensure weights and returns aligned
-weights, rets = weights.align(rets, join="inner", axis=0)
-daily_portfolio_rets = (weights.shift(1) * rets).sum(axis=1)
-strategy_rets = daily_portfolio_rets.fillna(0)
+    print("\n===== Performance Summary =====")
+    print(f"Total Return:      {total_ret * 100:8.2f}%")
+    print(f"Annualized Return: {ann_ret * 100:8.2f}%")
+    print(f"Annualized Vol:    {ann_vol * 100:8.2f}%")
+    print(f"Sharpe Ratio:      {sharpe:8.2f}")
+    print(f"Max Drawdown:      {max_dd * 100:8.2f}%")
 
-# ---------------------------------------------------------------------
-# Compute performance metrics
-# ---------------------------------------------------------------------
-total_return = (1 + strategy_rets).prod() - 1
-ann_return = (1 + total_return) ** (252 / len(strategy_rets)) - 1
-ann_vol = strategy_rets.std() * np.sqrt(252)
-sharpe = ann_return / ann_vol if ann_vol > 0 else np.nan
-cummax = (1 + strategy_rets).cumprod().cummax()
-drawdown = ((1 + strategy_rets).cumprod() / cummax - 1).min()
+    return port_val, port_rets, weights
 
-print("\n===== Performance Summary =====")
-print(f"Total Return:      {total_return:8.2%}")
-print(f"Annualized Return: {ann_return:8.2%}")
-print(f"Annualized Vol:    {ann_vol:8.2%}")
-print(f"Sharpe Ratio:      {sharpe:8.2f}")
-print(f"Max Drawdown:      {drawdown:8.2%}")
+def main():
+    parser = argparse.ArgumentParser(description="Run systematic backtest")
+    parser.add_argument("--strategy", required=True, help="Path to strategy .py file")
+    args = parser.parse_args()
 
-# ---------------------------------------------------------------------
-# Save results
-# ---------------------------------------------------------------------
-timestamp = datetime.now().strftime("%Y%m%d_%H%M")
-file_name = f"strategy_returns_{timestamp}.csv"
-output_path = OUTPUT_DIR / file_name
-strategy_rets.to_csv(output_path, index_label="date")
+    print("Loading CRSP data...")
+    data_path = "/home/nyu/willwu24/MPSIF-Systematic-Fund-2025/data/crsp_sp500_10yr.csv"
+    df = pd.read_csv(data_path, parse_dates=["date"])
 
-print(f"\nSaved daily strategy returns to: {output_path}")
+    df = df.rename(columns={"lpermno": "permno"})
+    df = df.sort_values(["permno", "date"])
+    df["ret"] = pd.to_numeric(df["ret"], errors="coerce")
 
-# Optionally, save summary log for team tracking
-summary_log = OUTPUT_DIR / "backtest_results.csv"
-summary_entry = pd.DataFrame([{
-    "timestamp": timestamp,
-    "strategy": Path(STRATEGY_PATH).stem,
-    "total_return": total_return,
-    "annualized_return": ann_return,
-    "annualized_vol": ann_vol,
-    "sharpe_ratio": sharpe,
-    "max_drawdown": drawdown
-}])
+    prices = df.pivot(index="date", columns="permno", values="prc")
+    rets = df.pivot(index="date", columns="permno", values="ret")
 
-if summary_log.exists():
-    existing = pd.read_csv(summary_log)
-    combined = pd.concat([existing, summary_entry], ignore_index=True)
-    combined.to_csv(summary_log, index=False)
-else:
-    summary_entry.to_csv(summary_log, index=False)
+    print(f"Loaded {len(df):,} rows from {df.date.min().date()} to {df.date.max().date()}.")
 
-print(f"Appended summary results to: {summary_log}")
+    strategy = load_strategy(args.strategy)
+    port_val, port_rets, weights = backtest(prices, rets, strategy)
+
+    # Save results
+    os.makedirs("data", exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+    results_path = f"data/strategy_returns_{timestamp}.csv"
+    weights_path = f"data/weights_{timestamp}.csv"
+
+    pd.DataFrame({
+        "date": port_val.index,
+        "portfolio_value": port_val.values,
+        "daily_return": port_rets.values
+    }).to_csv(results_path, index=False)
+
+    weights.to_csv(weights_path)
+
+    print(f"\nSaved backtest results to {results_path}")
+    print(f"Saved weight history to {weights_path}")
+
+if __name__ == "__main__":
+    main()
