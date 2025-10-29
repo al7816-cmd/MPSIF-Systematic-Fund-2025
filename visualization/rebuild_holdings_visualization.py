@@ -1,16 +1,12 @@
 #!/usr/bin/env python3
 """
-Visualize Portfolio Holdings from Weights File
+Visualize Portfolio Holdings with True Weights
 ----------------------------------------------
 
 Usage:
-    python visualization/rebuild_holdings_visualization.py --weights weights_20251029_1926.csv
+    python visualization/holdings_true_weights.py --weights data/weights_20251029_1926.csv
 
-This script:
-- Loads a weights CSV file (output from backtest)
-- Maps PERMNOs to tickers (if available)
-- Produces a stacked area chart of top holdings
-- Saves output to data/strategy_visualizations/
+Displays the actual percentage weight held in each top ticker (no scaling).
 """
 
 import argparse
@@ -20,10 +16,10 @@ from pathlib import Path
 from datetime import datetime
 
 # ---------------------------------------------------------------------
-# Parse CLI arguments
+# CLI arguments
 # ---------------------------------------------------------------------
-parser = argparse.ArgumentParser(description="Visualize portfolio holdings from weights file.")
-parser.add_argument("--weights", type=str, required=True, help="Weights CSV file in /data folder")
+parser = argparse.ArgumentParser(description="Visualize true holdings from weights CSV.")
+parser.add_argument("--weights", type=str, required=True, help="Path to weights CSV file.")
 args = parser.parse_args()
 
 # ---------------------------------------------------------------------
@@ -34,51 +30,31 @@ DATA_DIR = BASE_DIR / "data"
 VIS_DIR = DATA_DIR / "strategy_visualizations"
 VIS_DIR.mkdir(exist_ok=True)
 
-WEIGHTS_FILE = DATA_DIR / args.weights
-TICKER_FILE = DATA_DIR / "crsp_stocknames.csv"
+# ---------------------------------------------------------------------
+# Load weights
+# ---------------------------------------------------------------------
+print(f"Loading weights file: {args.weights}")
+weights = pd.read_csv(args.weights, index_col=0, parse_dates=True)
 
 # ---------------------------------------------------------------------
-# Load weights file
+# Check total portfolio weight
 # ---------------------------------------------------------------------
-print(f"Loading weights from: {WEIGHTS_FILE}")
-weights = pd.read_csv(WEIGHTS_FILE, index_col=0, parse_dates=True)
-weights = weights.sort_index()
-
-# Normalize if necessary
-weights_sum = weights.sum(axis=1)
-if (weights_sum.mean() < 0.95) or (weights_sum.mean() > 1.05):
-    print("⚠️ Warning: weights do not sum to 1 on average. Normalizing now.")
-    weights = weights.div(weights_sum, axis=0).fillna(0)
+weights["total_weight"] = weights.sum(axis=1)
+print(f"Median total portfolio weight: {weights['total_weight'].median():.3f}")
 
 # ---------------------------------------------------------------------
-# Map lpermno → ticker names (if lookup file exists)
-# ---------------------------------------------------------------------
-if TICKER_FILE.exists():
-    lookup = pd.read_csv(TICKER_FILE)
-    lookup = lookup.dropna(subset=["ticker"])
-    permno_to_ticker = dict(zip(lookup["permno"], lookup["ticker"]))
-
-    def rename_column(c):
-        try:
-            return permno_to_ticker.get(int(c), c)
-        except ValueError:
-            return c
-
-    weights.columns = [rename_column(c) for c in weights.columns]
-else:
-    print("⚠️ Ticker lookup file not found. Using numeric IDs instead.")
-
-# ---------------------------------------------------------------------
-# Keep top holdings for clarity
+# Select top assets by average weight
 # ---------------------------------------------------------------------
 top_n = 10
-top_assets = weights.mean().nlargest(top_n).index
+top_assets = weights.drop(columns=["total_weight"], errors="ignore").mean().nlargest(top_n).index
 weights_top = weights[top_assets].copy()
-weights_top["Others"] = 1 - weights_top.sum(axis=1)
-weights_top["Others"] = weights_top["Others"].clip(lower=0)
+
+# Compute "Others" = all remaining weights
+weights_top["Others"] = (weights.drop(columns=["total_weight"], errors="ignore").sum(axis=1)
+                         - weights_top.sum(axis=1)).clip(lower=0)
 
 # ---------------------------------------------------------------------
-# Plot holdings
+# Plot
 # ---------------------------------------------------------------------
 plt.style.use("seaborn-v0_8-whitegrid")
 fig, ax = plt.subplots(figsize=(12, 6))
@@ -96,8 +72,8 @@ plt.tight_layout()
 # Save visualization
 # ---------------------------------------------------------------------
 timestamp = datetime.now().strftime("%Y%m%d_%H%M")
-output_path = VIS_DIR / f"holdings_{Path(args.weights).stem}_{timestamp}.png"
-plt.savefig(output_path, dpi=300)
+output_file = VIS_DIR / f"holdings_true_{Path(args.weights).stem}_{timestamp}.png"
+plt.savefig(output_file, dpi=300)
 plt.show()
 
-print(f"Saved holdings visualization to: {output_path}")
+print(f"✅ Saved true-weight holdings visualization to: {output_file}")
