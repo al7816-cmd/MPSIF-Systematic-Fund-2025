@@ -3,51 +3,40 @@ import numpy as np
 
 def generate_weights(prices: pd.DataFrame, rets: pd.DataFrame):
     """
-    12-month momentum strategy with monthly rebalancing
-    ---------------------------------------------------
-    - Skip the most recent month
-    - Compute trailing 12-month returns for all stocks
-    - Pick top 25 by momentum each month
-    - Weight by inverse volatility over past year
-    - Normalize to full exposure every month
+    Momentum strategy: ranks stocks by 12-month return (excluding most recent month)
+    and holds top 20% each month, equally weighted.
     """
 
-    prices.index = pd.to_datetime(prices.index)
+    lookback = 252       # ~12 months
+    skip = 21            # skip last month
+    top_quantile = 0.2   # top 20% by momentum
 
-    # --- 1. Monthly data ---
-    monthly_prices = prices.resample("M").last()
-    momentum = (monthly_prices / monthly_prices.shift(12)) - 1
-    momentum = momentum.shift(1)  # skip most recent month
-    vol = rets.rolling(252).std().resample("M").last().replace(0, np.nan)
+    # Compute rolling 12-month returns excluding last month
+    past_ret = prices.pct_change(lookback + skip).shift(skip)
 
-    # --- 2. Monthly rebalance dates ---
-    rebalance_dates = momentum.index
-    weight_list = []
+    # Resample to month-end for rebalancing
+    monthly_dates = prices.resample("M").last().index
+    weights = pd.DataFrame(index=prices.index, columns=prices.columns, dtype=float)
 
-    for date in rebalance_dates:
-        mom = momentum.loc[date].dropna()
-        sigma = vol.loc[date].dropna()
-        common = mom.index.intersection(sigma.index)
-        if len(common) < 25:
+    for date in monthly_dates:
+        if date not in past_ret.index:
             continue
+        # Rank momentum on this date
+        mom_scores = past_ret.loc[date]
+        cutoff = mom_scores.quantile(1 - top_quantile)
+        winners = mom_scores[mom_scores >= cutoff].index
 
-        mom = mom.loc[common]
-        sigma = sigma.loc[common]
+        w = pd.Series(0, index=prices.columns, dtype=float)
+        if len(winners) > 0:
+            w[winners] = 1.0 / len(winners)
+        weights.loc[date] = w
 
-        # top 25 by momentum
-        top = mom.nlargest(25)
-        inv_vol = 1 / sigma.loc[top.index]
-        inv_vol = inv_vol / inv_vol.sum()
-        weight_list.append(pd.Series(inv_vol, name=date))
+    # Forward-fill weights until next rebalance
+    weights = weights.ffill().fillna(0)
 
-    weights = pd.concat(weight_list, axis=1).T
-
-    # --- 3. Expand to daily frequency (ffill within each month) ---
-    weights = weights.reindex(prices.index).ffill().fillna(0)
-
-    # --- 4. Normalize exposure daily among live stocks ---
+    # 🔹 Re-normalize each day among live stocks (ensures full 100% exposure)
     for date in prices.index:
-        live = prices.loc[date].dropna().index.intersection(weights.columns)
+        live = prices.loc[date].dropna().index
         if len(live) == 0:
             continue
         w = weights.loc[date, live]
