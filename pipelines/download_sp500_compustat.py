@@ -1,12 +1,19 @@
 #!/usr/bin/env python3
 """
 Download Compustat daily data for all S&P 500 constituents whose membership
-overlaps the last N years, and save as PARQUET.
+overlaps the last N years, compute proper daily total returns including dividends,
+and save as PARQUET.
 
-This version:
-  - Computes correct total-return daily returns (`ret`)
-  - Uses adj_prc_tr = (price/ajexdi) * trfd for dividend- and split-adjusted prices
-  - Ensures LAG is partitioned by permno and ordered by date
+Return formula implemented:
+    adj_prc      = prccd / ajexdi
+    trfd_ffill   = forward-fill trfd within each permno, fill missing with 1.0
+    adj_tr_price = adj_prc * trfd_ffill
+    ret_daily    = adj_tr_price / adj_tr_price.shift(1) - 1
+
+This provides CRSP-like total returns including dividends.
+
+Usage:
+    python pipelines/download_sp500_compustat_data.py --years 20
 """
 
 import wrds
@@ -16,17 +23,18 @@ from pathlib import Path
 import time
 import argparse
 
-# ---------------------------------------------------------------------
+
+# ------------------------------------------------------------
 # Parse input
-# ---------------------------------------------------------------------
+# ------------------------------------------------------------
 parser = argparse.ArgumentParser()
 parser.add_argument("--years", type=int, default=20,
-                    help="Number of years to download")
+                    help="Number of years of data to download")
 args = parser.parse_args()
 
-# ---------------------------------------------------------------------
-# Dates
-# ---------------------------------------------------------------------
+# ------------------------------------------------------------
+# Configuration
+# ------------------------------------------------------------
 END = date.today()
 START = (END - timedelta(days=365 * args.years)).strftime("%Y-%m-%d")
 END_STR = END.strftime("%Y-%m-%d")
@@ -37,20 +45,23 @@ OUT_PATH = OUT_DIR / f"compustat_sp500_{args.years}yr.parquet"
 
 BATCH_SIZE = 100
 
-print(f"Downloading S&P500 {args.years}yr data: {START} → {END_STR}")
-print(f"Output: {OUT_PATH}")
+print(f"Downloading {args.years} years of S&P 500 Compustat daily data")
+print(f"Window: {START} → {END_STR}")
+print(f"Saving to: {OUT_PATH}")
 
-# ---------------------------------------------------------------------
-# WRDS connect
-# ---------------------------------------------------------------------
+
+# ------------------------------------------------------------
+# Connect to WRDS
+# ------------------------------------------------------------
 print("Connecting to WRDS...")
 db = wrds.Connection()
 print("Connected.")
 
-# ---------------------------------------------------------------------
-# S&P 500 membership (correct intersection logic)
-# ---------------------------------------------------------------------
-print("Fetching S&P 500 permnos...")
+
+# ------------------------------------------------------------
+# Get S&P 500 PERMNOs whose membership intersects window
+# ------------------------------------------------------------
+print("Fetching S&P 500 constituent PERMNOs...")
 
 sp500 = db.raw_sql(f"""
     SELECT DISTINCT permno
@@ -60,14 +71,15 @@ sp500 = db.raw_sql(f"""
 """)
 
 permnos = sp500["permno"].dropna().astype(int).unique().tolist()
-print(f"Found {len(permnos)} permnos.")
+print(f"Found {len(permnos)} valid S&P 500 PERMNOs.")
 
 if not permnos:
-    raise RuntimeError("No S&P 500 constituents found.")
+    raise RuntimeError("No S&P 500 constituents in date window.")
 
-# ---------------------------------------------------------------------
-# Batch fetch
-# ---------------------------------------------------------------------
+
+# ------------------------------------------------------------
+# Batch fetcher
+# ------------------------------------------------------------
 def fetch_batch(batch_permnos):
 
     permnos_str = ", ".join(str(p) for p in batch_permnos)
@@ -80,9 +92,9 @@ def fetch_batch(batch_permnos):
                 l.liid AS iid,
                 l.linkdt,
                 COALESCE(l.linkenddt, DATE '9999-12-31') AS linkenddt
-            FROM crsp.ccmxpf_linktable l
-            WHERE l.linktype IN ('LU','LC')
-              AND l.linkprim IN ('P','C')
+            FROM crsp.ccmxpf_linktable AS l
+            WHERE l.linktype IN ('LU', 'LC')
+              AND l.linkprim IN ('P', 'C')
               AND l.lpermno IN ({permnos_str})
         ),
 
@@ -107,12 +119,11 @@ def fetch_batch(batch_permnos):
                 sec.prccd,
                 sec.ajexdi,
                 sec.trfd,
-                (sec.prccd / NULLIF(sec.ajexdi, 0)) AS adj_prc,
-                (sec.prccd / NULLIF(sec.ajexdi, 0)) * sec.trfd AS adj_prc_tr
+                (sec.prccd / NULLIF(sec.ajexdi, 0)) AS adj_prc
             FROM sec
-            JOIN linked lk
+            JOIN linked AS lk
               ON sec.gvkey = lk.gvkey
-             AND sec.iid   = lk.iid
+             AND sec.iid = lk.iid
              AND sec.datadate BETWEEN lk.linkdt AND lk.linkenddt
         )
 
@@ -122,20 +133,7 @@ def fetch_batch(batch_permnos):
             prccd,
             ajexdi,
             trfd,
-            adj_prc,
-            adj_prc_tr,
-            CASE
-                WHEN LAG(adj_prc_tr) OVER (
-                        PARTITION BY permno
-                        ORDER BY date
-                ) IS NULL
-                THEN NULL
-                ELSE adj_prc_tr /
-                     LAG(adj_prc_tr) OVER (
-                        PARTITION BY permno
-                        ORDER BY date
-                     ) - 1.0
-            END AS ret
+            adj_prc
         FROM joined
         ORDER BY permno, date
     """
@@ -143,14 +141,14 @@ def fetch_batch(batch_permnos):
     return db.raw_sql(sql, date_cols=["date"])
 
 
-# ---------------------------------------------------------------------
-# Download loop
-# ---------------------------------------------------------------------
+# ------------------------------------------------------------
+# Download in batches
+# ------------------------------------------------------------
 all_data = []
 
 for i in range(0, len(permnos), BATCH_SIZE):
-    batch = permnos[i : i + BATCH_SIZE]
-    print(f"Batch {i//BATCH_SIZE+1}: permnos {i+1}-{i+len(batch)}")
+    batch = permnos[i:i+BATCH_SIZE]
+    print(f"Batch {i//BATCH_SIZE+1}: PERMNOs {i+1}–{i+len(batch)} of {len(permnos)}")
     df_batch = fetch_batch(batch)
     all_data.append(df_batch)
     time.sleep(1)
@@ -158,11 +156,31 @@ for i in range(0, len(permnos), BATCH_SIZE):
 db.close()
 
 df = pd.concat(all_data, ignore_index=True)
-print(f"Total rows: {len(df):,}")
+print(f"Total rows downloaded: {len(df):,}")
 
-# ---------------------------------------------------------------------
-# Save
-# ---------------------------------------------------------------------
-print(f"Saving parquet → {OUT_PATH}")
+
+# ------------------------------------------------------------
+# Compute proper daily total returns
+# ------------------------------------------------------------
+print("Computing daily adjusted prices and returns...")
+
+df = df.sort_values(["permno", "date"])
+
+# 1. Split-adjusted price already computed as adj_prc
+
+# 2. Forward-fill dividend factor trfd
+df["trfd_ffill"] = df.groupby("permno")["trfd"].ffill().fillna(1.0)
+
+# 3. Total-return adjusted price
+df["adj_tr_price"] = df["adj_prc"] * df["trfd_ffill"]
+
+# 4. Daily total return (CRSP-like)
+df["ret_daily"] = df.groupby("permno")["adj_tr_price"].pct_change()
+
+
+# ------------------------------------------------------------
+# Save to parquet
+# ------------------------------------------------------------
+print(f"Saving Parquet → {OUT_PATH}")
 df.to_parquet(OUT_PATH, index=False)
-print("Done.")
+print("Done. File written successfully.")
